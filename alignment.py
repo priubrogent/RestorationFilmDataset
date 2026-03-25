@@ -48,10 +48,7 @@ def align_two_images(tgt: np.ndarray, src: np.ndarray) -> tuple[np.ndarray | Non
         # Low confidence – return a plain resize instead of a bad warp
         return src_resized, None
 
-    # Apply warp to uint8 version to preserve colors, then convert back to float
-    src_uint8 = (src_resized * 255).astype(np.uint8)
-    aligned_uint8 = cv2.warpAffine(src_uint8, M, (w, h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
-    aligned = aligned_uint8.astype(np.float32) / 255.0
+    aligned = cv2.warpAffine(src_resized, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
 
     return aligned, M
 
