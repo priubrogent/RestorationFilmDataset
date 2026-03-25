@@ -126,14 +126,16 @@ def compute_frame(
     diff_max = max(diff_combined.max(), 1e-6)
     diff_uint8 = (np.clip(diff_combined / diff_max, 0, 1) * 255).astype(np.uint8)
 
-    # Aligned restored frames (with original colors preserved via proper conversion)
-    r1_bgr_al = (np.clip(r1_al, 0, 1) * 255).astype(np.uint8)
-    r2_bgr_al = (np.clip(r2_al, 0, 1) * 255).astype(np.uint8)
-
-    # Resize original restored to match scan dimensions (for saving unaligned originals)
+    # Apply ECC warp directly to original uint8 frames — no float roundtrip, no color change
     h, w = scan_bgr.shape[:2]
-    r1_bgr_resized = cv2.resize(r1_bgr_orig, (w, h), interpolation=cv2.INTER_LANCZOS4)
-    r2_bgr_resized = cv2.resize(r2_bgr_orig, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    r1_base = r1_bgr_orig if r1_bgr_orig.shape[:2] == (h, w) else cv2.resize(r1_bgr_orig, (w, h), interpolation=cv2.INTER_LINEAR)
+    r2_base = r2_bgr_orig if r2_bgr_orig.shape[:2] == (h, w) else cv2.resize(r2_bgr_orig, (w, h), interpolation=cv2.INTER_LINEAR)
+    r1_bgr_al = cv2.warpAffine(r1_base, M1, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT) if M1 is not None else r1_base.copy()
+    r2_bgr_al = cv2.warpAffine(r2_base, M2, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT) if M2 is not None else r2_base.copy()
+
+    # Unaligned originals (just resized to scan dims)
+    r1_bgr_resized = r1_base
+    r2_bgr_resized = r2_base
 
     out = {
         "frame":       frame_num,
