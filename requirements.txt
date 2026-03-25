@@ -1,0 +1,9 @@
+opencv-python
+numpy
+matplotlib
+tqdm
+scipy
+torch
+torchvision
+Pillow
+simple-lama-inpainting

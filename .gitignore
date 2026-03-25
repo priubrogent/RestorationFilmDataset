@@ -1,0 +1,10 @@
+__pycache__
+masks_out
+offset_check_shining
+offset_check_shining_old
+*.png
+*.jpg
+dataset
+.venv
+.scene_cache
+README.md
