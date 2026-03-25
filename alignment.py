@@ -48,7 +48,7 @@ def align_two_images(tgt: np.ndarray, src: np.ndarray) -> tuple[np.ndarray | Non
         # Low confidence – return a plain resize instead of a bad warp
         return src_resized, None
 
-    aligned = cv2.warpAffine(src_resized, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+    aligned = cv2.warpAffine(src_resized, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
     return aligned, M
 
