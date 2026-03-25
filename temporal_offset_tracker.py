@@ -18,20 +18,14 @@ confirmed offset — drift is slow so this is fine.
 The search is done on low-resolution grayscale frames (~240×135) so it adds
 negligible overhead.
 
-Strictness improvements
-------------------------
+OPTIMIZED version:
+- Batch extraction: All candidate restored frames are read in a single sequential
+  pass through the video, avoiding costly random seeks.
 - Cached VideoCapture: caps opened once in __init__, never closed until __del__.
-  Eliminates the dominant per-frame overhead and allows more frames per anchor.
-- Multi-frame NCC: for each candidate offset, NCC is averaged across
-  `2*n_verify + 1` scan frames (anchor ± n_verify × verify_step). Averaging
-  suppresses noise from motion blur or bad frames at a single point.
-- Larger default search_range (20) and denser anchor_interval (25).
-- Higher-resolution thumbnails (240×135 instead of 160×90).
-- min_conf retry: if best NCC after full search < min_conf, the range doubles
-  and the search is repeated once before accepting the result.
-- keep_threshold: if the final best NCC is still below keep_threshold the
-  current offset is NOT updated (previous value preserved).
-- is_exhausted: True when scan returns None for 3+ consecutive anchor searches.
+- Single-frame matching by default (n_verify=0) for speed. Multi-frame optional.
+- Smaller default search_range (8) since drift is typically slow.
+- Conservative offset updates: only update if new offset is within max_jump of
+  current offset, preventing wild jumps from false matches.
 """
 
 import csv
@@ -53,7 +47,14 @@ def _ncc(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom) if denom >= 1e-8 else 0.0
 
 
-def _read_frame(cap: cv2.VideoCapture, frame_idx: int) -> np.ndarray | None:
+def _read_frame_sequential(cap: cv2.VideoCapture) -> np.ndarray | None:
+    """Read next frame without seeking (fast sequential access)."""
+    ret, frame = cap.read()
+    return frame if ret else None
+
+
+def _seek_and_read(cap: cv2.VideoCapture, frame_idx: int) -> np.ndarray | None:
+    """Seek to specific frame and read it."""
     if frame_idx < 0:
         return None
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -62,6 +63,37 @@ def _read_frame(cap: cv2.VideoCapture, frame_idx: int) -> np.ndarray | None:
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ret, frame = cap.read()
     return frame if ret else None
+
+
+def _batch_read_frames(cap: cv2.VideoCapture, start_idx: int, count: int) -> list[tuple[int, np.ndarray | None]]:
+    """
+    Read `count` consecutive frames starting at `start_idx`.
+    Returns list of (frame_idx, frame_or_None) tuples.
+    Much faster than random seeking for each frame.
+    """
+    results = []
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if start_idx < 0:
+        # Handle negative start: pad with None
+        for i in range(start_idx, min(0, start_idx + count)):
+            results.append((i, None))
+        start_idx = 0
+        count = count - len(results)
+
+    if start_idx >= total or count <= 0:
+        return results
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+    for i in range(count):
+        idx = start_idx + i
+        if idx >= total:
+            results.append((idx, None))
+        else:
+            ret, frame = cap.read()
+            results.append((idx, frame if ret else None))
+
+    return results
 
 
 @dataclass
@@ -73,40 +105,50 @@ class AnchorPoint:
 
 
 class TemporalOffsetTracker:
+    """
+    Tracks temporal offset drift between scan and restored video.
+
+    The offset convention is: restored_frame = scan_frame + offset
+    So if offset=-38, scan frame 400 corresponds to restored frame 362.
+    """
     def __init__(
         self,
         scan_path: str,
         restored_path: str,
         initial_offset: int,
-        anchor_interval: int = 25,
-        search_range: int = 20,
-        resize: tuple = (240, 135),
+        anchor_interval: int = 50,
+        search_range: int = 8,
+        resize: tuple = (320, 180),
         verbose: bool = True,
-        low_conf_threshold: float = 0.35,
-        low_conf_patience: int = 2,
-        max_search_multiplier: int = 4,
-        n_verify: int = 2,
-        verify_step: int = 4,
-        min_conf: float = 0.30,
-        keep_threshold: float = 0.20,
+        min_conf: float = 0.70,
+        keep_threshold: float = 0.60,
+        max_jump: int = 5,
     ):
+        """
+        Args:
+            scan_path: Path to the scan (degraded) video
+            restored_path: Path to the restored video
+            initial_offset: Known starting offset (restored = scan + offset)
+            anchor_interval: Re-check offset every N frames
+            search_range: Search ±N frames around current offset
+            resize: Thumbnail size for NCC comparison
+            verbose: Print debug info
+            min_conf: Minimum NCC to accept a match
+            keep_threshold: Below this NCC, keep previous offset
+            max_jump: Maximum allowed offset change per anchor (prevents wild jumps)
+        """
         self.scan_path       = scan_path
         self.restored_path   = restored_path
         self.anchor_interval = anchor_interval
         self.search_range    = search_range
         self.resize          = resize
         self.verbose         = verbose
-        self.low_conf_threshold   = low_conf_threshold
-        self.low_conf_patience    = low_conf_patience
-        self.max_search_multiplier = max_search_multiplier
-        self.n_verify        = n_verify
-        self.verify_step     = verify_step
         self.min_conf        = min_conf
         self.keep_threshold  = keep_threshold
+        self.max_jump        = max_jump
 
+        self._initial_offset     = initial_offset
         self._current_offset     = initial_offset
-        self._range_multiplier   = 1
-        self._consecutive_low    = 0
         self._consecutive_none   = 0
         self._anchors: list[AnchorPoint] = [
             AnchorPoint(frame_num=0, offset=initial_offset, confidence=1.0, searched=False)
@@ -131,39 +173,30 @@ class TemporalOffsetTracker:
         return self._consecutive_none >= 3
 
     def get_offset(self, frame_num: int) -> int:
+        """Get the offset for a given scan frame number."""
         if frame_num % self.anchor_interval == 0:
-            new_offset, confidence = self._search_best_offset(frame_num, self._current_offset)
+            new_offset, confidence = self._search_best_offset(frame_num)
 
             if confidence == -1.0:
                 self._consecutive_none += 1
                 confidence = 0.0
             else:
                 self._consecutive_none = 0
-                if confidence < self.low_conf_threshold:
-                    self._consecutive_low += 1
-                    if self._consecutive_low >= self.low_conf_patience:
-                        self._range_multiplier = min(
-                            self._range_multiplier * 2,
-                            self.max_search_multiplier,
-                        )
-                        if self.verbose:
-                            eff = self.search_range * self._range_multiplier
-                            print(f"  [OffsetTracker] low confidence ({confidence:.3f}) "
-                                  f"— expanding search to ±{eff}")
-                else:
-                    self._consecutive_low = 0
-                    self._range_multiplier = 1
 
-                if confidence >= self.keep_threshold:
-                    self._current_offset = new_offset
-                else:
-                    if self.verbose:
-                        print(f"  [OffsetTracker] frame={frame_num:6d}  "
-                              f"confidence={confidence:.3f} below keep_threshold={self.keep_threshold} "
-                              f"— keeping offset={self._current_offset:+d}")
+            # Decide whether to update offset
+            jump = abs(new_offset - self._current_offset)
+            if confidence >= self.keep_threshold and jump <= self.max_jump:
+                self._current_offset = new_offset
+            elif confidence >= self.keep_threshold and jump > self.max_jump:
+                # Large jump detected - move gradually toward it
+                direction = 1 if new_offset > self._current_offset else -1
+                self._current_offset += direction * self.max_jump
+                if self.verbose:
+                    print(f"  [OffsetTracker] frame={frame_num:6d}  large jump detected "
+                          f"({jump} frames), moving gradually to {self._current_offset:+d}")
 
             self._anchors.append(AnchorPoint(
-                frame_num=frame_num, offset=new_offset,
+                frame_num=frame_num, offset=self._current_offset,
                 confidence=confidence, searched=True,
             ))
             if self.verbose:
@@ -190,66 +223,49 @@ class TemporalOffsetTracker:
     def anchors(self) -> list[AnchorPoint]:
         return self._anchors
 
-    def _collect_scan_thumbs(self, anchor_fn: int) -> list[np.ndarray]:
-        thumbs = []
-        for k in range(-self.n_verify, self.n_verify + 1):
-            fn = anchor_fn + k * self.verify_step
-            frame = _read_frame(self._scan_cap, fn)
-            if frame is not None:
-                thumbs.append(_to_small_gray(frame, self.resize))
-        return thumbs
+    def _search_best_offset(self, scan_frame_num: int) -> tuple[int, float]:
+        """
+        Search for the best offset by comparing scan frame to candidate restored frames.
 
-    def _score_offset(self, scan_thumbs: list[np.ndarray], anchor_fn: int, test_offset: int) -> float:
-        scores = []
-        for k in range(-self.n_verify, self.n_verify + 1):
-            scan_idx = self.n_verify + k
-            if scan_idx >= len(scan_thumbs):
-                continue
-            fn = anchor_fn + k * self.verify_step
-            rest_frame = _read_frame(self._restored_cap, fn + test_offset)
-            if rest_frame is None:
-                continue
-            scores.append(_ncc(scan_thumbs[scan_idx], _to_small_gray(rest_frame, self.resize)))
-        return float(np.mean(scores)) if scores else 0.0
+        Uses batch reading for speed: reads all candidate frames in one sequential pass.
 
-    def _search_range_for_offset(
-        self,
-        scan_thumbs: list[np.ndarray],
-        anchor_fn: int,
-        current_offset: int,
-        eff_range: int,
-    ) -> tuple[int, float]:
-        best_offset = current_offset
-        best_score  = -1.0
-        for test_offset in range(current_offset - eff_range, current_offset + eff_range + 1):
-            score = self._score_offset(scan_thumbs, anchor_fn, test_offset)
+        Returns:
+            (best_offset, confidence) where confidence is the NCC score
+        """
+        # Read the scan frame
+        scan_frame = _seek_and_read(self._scan_cap, scan_frame_num)
+        if scan_frame is None:
+            return self._current_offset, -1.0
+
+        scan_thumb = _to_small_gray(scan_frame, self.resize)
+
+        # Calculate the range of restored frames to check
+        # restored_frame = scan_frame + offset
+        center_restored = scan_frame_num + self._current_offset
+        start_restored = center_restored - self.search_range
+        end_restored = center_restored + self.search_range
+        num_candidates = end_restored - start_restored + 1
+
+        # Batch read all candidate frames (fast sequential read)
+        candidates = _batch_read_frames(self._restored_cap, start_restored, num_candidates)
+
+        # Score each candidate
+        best_offset = self._current_offset
+        best_score = -1.0
+
+        for restored_idx, restored_frame in candidates:
+            if restored_frame is None:
+                continue
+
+            restored_thumb = _to_small_gray(restored_frame, self.resize)
+            score = _ncc(scan_thumb, restored_thumb)
+
             if score > best_score:
-                best_score  = score
-                best_offset = test_offset
+                best_score = score
+                # offset = restored_frame_idx - scan_frame_num
+                best_offset = restored_idx - scan_frame_num
+
         return best_offset, max(0.0, best_score)
-
-    def _search_best_offset(self, frame_num: int, current_offset: int) -> tuple[int, float]:
-        scan_thumbs = self._collect_scan_thumbs(frame_num)
-        if not scan_thumbs:
-            return current_offset, -1.0
-
-        eff_range = self.search_range * self._range_multiplier
-        best_offset, best_score = self._search_range_for_offset(
-            scan_thumbs, frame_num, current_offset, eff_range
-        )
-
-        if best_score < self.min_conf:
-            retry_range = eff_range * 2
-            if self.verbose:
-                print(f"  [OffsetTracker] frame={frame_num:6d}  score={best_score:.3f} < min_conf "
-                      f"— retrying with range ±{retry_range}")
-            retry_offset, retry_score = self._search_range_for_offset(
-                scan_thumbs, frame_num, current_offset, retry_range
-            )
-            if retry_score > best_score:
-                best_offset, best_score = retry_offset, retry_score
-
-        return best_offset, best_score
 
 
 def plot_offset_log(csv_path: str, output_path: str = None):

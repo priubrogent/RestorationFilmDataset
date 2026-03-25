@@ -22,14 +22,18 @@ def align_two_images(tgt: np.ndarray, src: np.ndarray) -> tuple[np.ndarray | Non
             aligned – warped src as float32 BGR, same size as tgt. None on failure.
             M       – 2×3 affine transformation matrix. None if ECC failed or confidence low.
     """
-    src_gray = cv2.cvtColor((src * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    h, w = tgt.shape[:2]
+
+    # Convert to uint8 for ECC computation (grayscale)
     tgt_gray = cv2.cvtColor((tgt * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
 
+    # Resize src to target dimensions first (using high-quality Lanczos)
     if src.shape[:2] != tgt.shape[:2]:
-        src_resized = cv2.resize(src, (tgt.shape[1], tgt.shape[0]), interpolation=cv2.INTER_LINEAR)
-        src_gray = cv2.resize(src_gray, (tgt.shape[1], tgt.shape[0]), interpolation=cv2.INTER_LINEAR)
+        src_resized = cv2.resize(src, (w, h), interpolation=cv2.INTER_LANCZOS4)
     else:
-        src_resized = src
+        src_resized = src.copy()
+
+    src_gray = cv2.cvtColor((src_resized * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
 
     M = np.eye(2, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 5000, 1e-6)
@@ -42,10 +46,13 @@ def align_two_images(tgt: np.ndarray, src: np.ndarray) -> tuple[np.ndarray | Non
 
     if cc < 0.5:
         # Low confidence – return a plain resize instead of a bad warp
-        return cv2.resize(src, (tgt.shape[1], tgt.shape[0]), interpolation=cv2.INTER_LINEAR), None
+        return src_resized, None
 
-    h, w = tgt.shape[:2]
-    aligned = cv2.warpAffine(src_resized, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+    # Apply warp to uint8 version to preserve colors, then convert back to float
+    src_uint8 = (src_resized * 255).astype(np.uint8)
+    aligned_uint8 = cv2.warpAffine(src_uint8, M, (w, h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
+    aligned = aligned_uint8.astype(np.float32) / 255.0
+
     return aligned, M
 
 

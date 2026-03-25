@@ -1,0 +1,1 @@
+ generate_masks.py --start 400 --count 206851 --every 50 --workers 7 --output /data/storage/users/priubrogent/filmdataset/outputs --save-corrected --save-inpainted --adaptive-offset --anchor-interval 25 --search-range 20 --vis-every 50

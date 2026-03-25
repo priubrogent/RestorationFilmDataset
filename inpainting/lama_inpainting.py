@@ -51,10 +51,15 @@ class LamaInpainter:
     def _init_simple_lama(self):
         """Initialize simple-lama-inpainting backend"""
         try:
+            import torch
+            # Force CPU if CUDA not available or requested
+            if self.device == "cpu" or not torch.cuda.is_available():
+                import os
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""
             from simple_lama_inpainting import SimpleLama
             logger.info("Loading SimpleLama model")
-            self.model = SimpleLama()
-            logger.info("SimpleLama loaded successfully")
+            self.model = SimpleLama(device=torch.device(self.device))
+            logger.info(f"SimpleLama loaded successfully on {self.device}")
         except ImportError:
             logger.error("simple-lama-inpainting not installed")
             logger.error("Install with: pip install simple-lama-inpainting")

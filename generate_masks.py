@@ -51,7 +51,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Hardcoded defaults for The Shining
 # ---------------------------------------------------------------------------
-VIDEOS_DIR    = "../NewTriAlign/videos"
+VIDEOS_DIR    = "/data/storage/users/priubrogent/filmdataset/videos"
 SCAN_VIDEO    = f"{VIDEOS_DIR}/The.Shining.1980.35mm.Scan.FullScreen.HYBRID.OPEN.MATTE.1080p.mkv"
 R1_VIDEO      = f"{VIDEOS_DIR}/shining_restored-46.mkv"
 R1_OFFSET     = -46
@@ -98,36 +98,56 @@ def compute_frame(
     if scan_bgr is None:
         return {"frame": frame_num, "failed": True, "reason": "scan_none"}
 
-    r1_bgr = extract_frame_with_offset(r1_path, frame_num, r1_offset)
-    r2_bgr = extract_frame_with_offset(r2_path, frame_num, r2_offset)
-    if r1_bgr is None or r2_bgr is None:
+    r1_bgr_orig = extract_frame_with_offset(r1_path, frame_num, r1_offset)
+    r2_bgr_orig = extract_frame_with_offset(r2_path, frame_num, r2_offset)
+    if r1_bgr_orig is None or r2_bgr_orig is None:
         return {"frame": frame_num, "failed": True, "reason": "restored_none"}
 
     scan_f = scan_bgr.astype(np.float32) / 255.0
-    r1_f   = r1_bgr.astype(np.float32)  / 255.0
-    r2_f   = r2_bgr.astype(np.float32)  / 255.0
+    r1_f   = r1_bgr_orig.astype(np.float32) / 255.0
+    r2_f   = r2_bgr_orig.astype(np.float32) / 255.0
 
     r1_al, r2_al, M1, M2 = align_three_images(scan_f, r1_f, r2_f)
     if r1_al is None or r2_al is None:
         return {"frame": frame_num, "failed": True, "reason": "align_failed"}
 
+    # Generate gradient difference maps (raw, not binarized)
     diff1 = generate_gradient_difference_mask(scan_f, r1_al)
     diff2 = generate_gradient_difference_mask(scan_f, r2_al)
-    mask  = compute_defect_mask(diff1, diff2, threshold=threshold)
 
+    # Combine the two difference maps: take minimum (defect must appear in both)
+    diff_combined = np.minimum(diff1, diff2)
+    diff_combined = np.clip(diff_combined, 0, None)  # Only positive differences (scan has more edges)
+
+    # Binary mask
+    mask = compute_defect_mask(diff1, diff2, threshold=threshold)
+
+    # Convert diff to uint8 for saving (normalize to 0-255)
+    diff_max = max(diff_combined.max(), 1e-6)
+    diff_uint8 = (np.clip(diff_combined / diff_max, 0, 1) * 255).astype(np.uint8)
+
+    # Aligned restored frames (with original colors preserved via proper conversion)
     r1_bgr_al = (np.clip(r1_al, 0, 1) * 255).astype(np.uint8)
     r2_bgr_al = (np.clip(r2_al, 0, 1) * 255).astype(np.uint8)
 
+    # Resize original restored to match scan dimensions (for saving unaligned originals)
+    h, w = scan_bgr.shape[:2]
+    r1_bgr_resized = cv2.resize(r1_bgr_orig, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    r2_bgr_resized = cv2.resize(r2_bgr_orig, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
     out = {
-        "frame":    frame_num,
-        "failed":   False,
-        "scan":     scan_bgr,
-        "r1":       r1_bgr_al,
-        "r2":       r2_bgr_al,
-        "mask":     mask,
-        "mask_pct": float(np.mean(mask > 0) * 100),
-        "r1_ecc":   M1 is not None,
-        "r2_ecc":   M2 is not None,
+        "frame":       frame_num,
+        "failed":      False,
+        "scan":        scan_bgr,
+        "r1":          r1_bgr_al,          # Aligned restored1
+        "r2":          r2_bgr_al,          # Aligned restored2
+        "r1_orig":     r1_bgr_resized,     # Original restored1 (resized, not aligned)
+        "r2_orig":     r2_bgr_resized,     # Original restored2 (resized, not aligned)
+        "mask":        mask,               # Binary mask
+        "mask_raw":    diff_uint8,         # Raw difference map (not binarized)
+        "mask_pct":    float(np.mean(mask > 0) * 100),
+        "r1_ecc":      M1 is not None,
+        "r2_ecc":      M2 is not None,
     }
 
     if save_corrected:
@@ -148,21 +168,47 @@ def compute_frame(
 # ---------------------------------------------------------------------------
 
 def save_frame(result: dict, output_root: str):
+    """
+    Save frame outputs into category-based folders:
+        {output_root}/scan/{id}.png                 - Original scan (degraded)
+        {output_root}/restored1/{id}.png            - Aligned restored copy 1
+        {output_root}/restored2/{id}.png            - Aligned restored copy 2
+        {output_root}/restored1_orig/{id}.png       - Original restored copy 1 (not aligned)
+        {output_root}/restored2_orig/{id}.png       - Original restored copy 2 (not aligned)
+        {output_root}/mask/{id}.png                 - Binary defect mask
+        {output_root}/mask_raw/{id}.png             - Raw difference map (not binarized)
+        {output_root}/scan_corrected_1/{id}.png     - Scan with restored1 colors (if --save-corrected)
+        {output_root}/scan_corrected_2/{id}.png     - Scan with restored2 colors (if --save-corrected)
+        {output_root}/inpainted/{id}.png            - Inpainted scan (if --save-inpainted)
+    """
     fn = result["frame"]
-    folder = os.path.join(output_root, f"{DATASET_PREFIX}_{fn:06d}")
-    os.makedirs(folder, exist_ok=True)
+    filename = f"{DATASET_PREFIX}_{fn:06d}.png"
 
-    cv2.imwrite(os.path.join(folder, "scan.png"),      result["scan"])
-    cv2.imwrite(os.path.join(folder, "restored1.png"), result["r1"])
-    cv2.imwrite(os.path.join(folder, "restored2.png"), result["r2"])
-    cv2.imwrite(os.path.join(folder, "mask.png"),      result["mask"])
+    # Create category folders
+    folders = ["scan", "restored1", "restored2", "restored1_orig", "restored2_orig", "mask", "mask_raw"]
+    if "corrected1" in result:
+        folders.extend(["scan_corrected_1", "scan_corrected_2"])
+    if "inpainted" in result:
+        folders.append("inpainted")
+
+    for folder in folders:
+        os.makedirs(os.path.join(output_root, folder), exist_ok=True)
+
+    # Save images
+    cv2.imwrite(os.path.join(output_root, "scan", filename),           result["scan"])
+    cv2.imwrite(os.path.join(output_root, "restored1", filename),      result["r1"])
+    cv2.imwrite(os.path.join(output_root, "restored2", filename),      result["r2"])
+    cv2.imwrite(os.path.join(output_root, "restored1_orig", filename), result["r1_orig"])
+    cv2.imwrite(os.path.join(output_root, "restored2_orig", filename), result["r2_orig"])
+    cv2.imwrite(os.path.join(output_root, "mask", filename),           result["mask"])
+    cv2.imwrite(os.path.join(output_root, "mask_raw", filename),       result["mask_raw"])
 
     if "corrected1" in result:
-        cv2.imwrite(os.path.join(folder, "corrected1.png"), result["corrected1"])
-        cv2.imwrite(os.path.join(folder, "corrected2.png"), result["corrected2"])
+        cv2.imwrite(os.path.join(output_root, "scan_corrected_1", filename), result["corrected1"])
+        cv2.imwrite(os.path.join(output_root, "scan_corrected_2", filename), result["corrected2"])
 
     if "inpainted" in result:
-        cv2.imwrite(os.path.join(folder, "inpainted.png"), result["inpainted"])
+        cv2.imwrite(os.path.join(output_root, "inpainted", filename), result["inpainted"])
 
 
 # ---------------------------------------------------------------------------
