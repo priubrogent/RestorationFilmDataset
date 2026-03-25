@@ -151,7 +151,8 @@ def compute_frame(
     }
 
     if save_corrected:
-        # Colour of each restored transferred to the scan (restored = reference)
+        # Apply each restored's colour grade onto the scan frame
+        # Result: scan content with restored colour grade (scan_corrected_1/2)
         scan_rgb = _bgr_to_rgb(scan_bgr)
         r1_rgb   = _bgr_to_rgb(r1_bgr_al)
         r2_rgb   = _bgr_to_rgb(r2_bgr_al)
